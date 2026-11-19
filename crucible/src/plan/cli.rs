@@ -587,15 +587,6 @@ struct AgentServersNotBuilt {
 
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "--rerun-of names evidence on the controller, which is fetched with the run's token; this \
-     crucible is the hard-tools-only build and reads no run token. Pass the parent run's state \
-     directory instead"
-)]
-#[cfg_attr(feature = "agents", allow(dead_code))]
-struct RerunUrlNotBuilt;
-
-#[derive(Debug, thiserror::Error)]
-#[error(
     "a playbook needs {missing} from whoever launches it. Its source may not declare a limit its \
      operator set, so the engine will not dispatch a task without one."
 )]
@@ -642,7 +633,6 @@ fn record_git_memory(paths: &crate::args::Paths) -> Result<()> {
 }
 
 /// Where a rerun fetches a parent named by URL, inside its own state directory.
-#[cfg(feature = "agents")]
 const FETCHED_PARENT_DIR: &str = "rerun-parent";
 
 /// Seed a rerun: rebuild the workspace from the parent's base, the blobs its partial clone held
@@ -668,19 +658,9 @@ fn start_rerun(
             dir.clone()
         }
         ParentRef::Url(url) => {
-            // The hard-tools-only build reads no run token, so it cannot fetch a parent from
-            // the controller; a local state directory is the parent it accepts.
-            #[cfg(not(feature = "agents"))]
-            {
-                let _ = url;
-                return Err(RerunUrlNotBuilt.into());
-            }
-            #[cfg(feature = "agents")]
-            {
-                let dir = paths.state.join(FETCHED_PARENT_DIR);
-                crate::report::evidence_client::fetch_parent(url, &dir)?;
-                dir
-            }
+            let dir = paths.state.join(FETCHED_PARENT_DIR);
+            crate::report::evidence_client::fetch_parent(url, &dir)?;
+            dir
         }
     };
     let parent = crate::plan::rerun::ParentDir::read(&dir)?;
@@ -1163,16 +1143,11 @@ pub fn run(
             },
         );
     }
-    // The hard-tools-only build reads no run token and uploads nothing: it marks the session
-    // undelivered, so the pod wrapper prints it to the pod log, where the controller collects
-    // it when the run finishes (ADR-0078).
-    #[cfg(feature = "agents")]
+    // Both builds deliver; the hard-tools-only one carries no token, so an open controller takes
+    // its record bare and a guarded one's refusal marks the session for the pod-log scrape
+    // (ADR-0078).
     if let Some(p) = &evidence {
         crate::report::evidence_client::deliver_run_evidence(p);
-    }
-    #[cfg(not(feature = "agents"))]
-    if let Some(p) = &evidence {
-        let _ = crate::report::evidence_client::mark_session(&p.state, false);
     }
     println!(
         "plan v{}: {} — spent ${:.4} of ${}",
@@ -1872,17 +1847,112 @@ mod tests {
         (path, body)
     }
 
-    /// The evidence contract a pod-dispatched playbook rides (RFC-0004:C-RUN-EVIDENCE): a
-    /// manifest `plan run` uploads its git memory and then its session to its own run under its
-    /// run token, on the failing path too. The hard-tools-only build delivers no evidence.
-    /// The hard-tools-only build uploads nothing and reads no token; it marks the session
-    /// undelivered so the pod wrapper prints it to the pod log, where the controller's
-    /// completion edge collects it (ADR-0078).
+    /// The hard-tools-only build reads no run token: an open controller takes its record bare
+    /// (ADR-0078). The fake controller here stands for one — it answers every PUT with 200 —
+    /// and the test asserts the record arrived with no Authorization header at all.
     #[cfg(not(feature = "agents"))]
     #[test]
-    fn a_hard_tools_run_marks_its_session_undelivered_for_the_log_scrape() {
+    fn an_open_controller_takes_the_run_record_with_no_token() {
         let _guard = crucible::test_support::env_lock();
-        let dir = crate::testing::tempdir("hard-tools-undelivered");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let receiver = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            for s in listener.incoming() {
+                let (line, headers, body) =
+                    crate::testing::read_one_request(&mut s.expect("accept"));
+                if line.starts_with("GET /done ") {
+                    break;
+                }
+                got.push((line, headers, body));
+            }
+            got
+        });
+        let dir = crate::testing::tempdir("hard-tools-open-upload");
+        std::fs::write(
+            dir.join("workflow.star"),
+            "t = command(name = \"t\", run = \"echo '{\\\"ok\\\": true}'\")\nworkflow(type = \"playbook\", tasks = [t])\n",
+        )
+        .expect("workflow");
+        std::fs::write(
+            dir.join("crucible.toml"),
+            r#"
+            [repo]
+            path = "."
+            [workspace]
+            dir = "workspace"
+            setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+            [agent]
+            backend = "command"
+            agent_cmd = "true"
+            goal = "deliver the session"
+            [workflow]
+            type = "playbook"
+            file = "workflow.star"
+            "#,
+        )
+        .expect("manifest");
+        let manifest = dir.join("crucible.toml");
+        let _env = ScopedEnv::set(&[
+            (
+                crucible_contract::ENV_CONTROLLER_URL,
+                format!("http://127.0.0.1:{port}/"),
+            ),
+            (crucible_contract::ENV_RUN_NAME, "open_run_1".into()),
+        ]);
+        run(
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            Some(&manifest),
+            RunOpts {
+                ceilings: Ceilings {
+                    usd: Some(1.0),
+                    wall_clock: Some(std::time::Duration::from_secs(60)),
+                    wall_clock_raw: Some("60s".to_string()),
+                },
+                ..Default::default()
+            },
+        )
+        .expect("the playbook reaches a verdict");
+        drop(_env);
+        reqwest::blocking::get(format!("http://127.0.0.1:{port}/done")).expect("stop");
+        let requests = receiver.join().expect("receiver");
+        assert!(
+            requests
+                .iter()
+                .any(|(l, _, _)| l.starts_with("PUT /api/evidence/runs/open_run_1/run-session")),
+            "the session was uploaded: {requests:?}"
+        );
+        for (_, headers, _) in &requests {
+            assert!(!headers.contains("authorization:"), "{headers}");
+        }
+        let state = crate::cli::setup::state_dir(&manifest);
+        assert!(
+            !state
+                .join(crucible_contract::RUN_SESSION_UNDELIVERED)
+                .is_file(),
+            "the session was delivered, so nothing marks it for the pod-log scrape"
+        );
+    }
+
+    /// A guarded controller refuses the tokenless upload; the run marks its session undelivered
+    /// so the pod wrapper prints it to the pod log, where the controller's completion edge
+    /// collects it (ADR-0078).
+    #[cfg(not(feature = "agents"))]
+    #[test]
+    fn a_refused_upload_marks_the_session_for_the_log_scrape() {
+        let _guard = crucible::test_support::env_lock();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for s in listener.incoming() {
+                let mut s = s.expect("accept");
+                let _ = crate::testing::answer_one_request(&mut s, "401 Unauthorized");
+            }
+        });
+        let dir = crate::testing::tempdir("hard-tools-refused-upload");
         std::fs::write(
             dir.join("workflow.star"),
             "t = command(name = \"t\", run = \"echo '{\\\"ok\\\": true}'\")\nworkflow(type = \"playbook\", tasks = [t])\n",
@@ -1907,6 +1977,13 @@ mod tests {
         )
         .expect("manifest");
         let manifest = dir.join("crucible.toml");
+        let _env = ScopedEnv::set(&[
+            (
+                crucible_contract::ENV_CONTROLLER_URL,
+                format!("http://127.0.0.1:{port}/"),
+            ),
+            (crucible_contract::ENV_RUN_NAME, "guarded_run_1".into()),
+        ]);
         run(
             None,
             &BTreeMap::new(),
