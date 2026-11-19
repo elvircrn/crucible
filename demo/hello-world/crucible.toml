@@ -1,0 +1,15 @@
+[repo]
+path = "."
+[workspace]
+dir = "workspace"
+setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+[[workspace.inject]]
+src = "run.py"
+dst = "run.py"
+[agent]
+backend = "command"
+agent_cmd = "true"
+goal = "print hello world"
+[workflow]
+type = "playbook"
+file = "workflow.star"
