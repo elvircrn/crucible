@@ -84,8 +84,8 @@ def main():
         time.sleep(20)
 
     if state != "succeeded":
-        tail = call("logs", build_id, "--tail-lines", "150")
-        print(json.dumps(tail)[-6000:])
+        tail = call("logs", build_id, "--tail", "150")
+        print(json.dumps({"status": status, "logs": tail})[-6000:])
         sys.exit(f"build {state}")
 
     print(json.dumps({

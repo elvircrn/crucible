@@ -35,8 +35,8 @@ params = {
     },
     "builder": {
         "type": "string",
-        "default": "buildkit",
-        "doc": "what builds the Dockerfile: buildkit keeps a layer cache, buildah is the fallback",
+        "default": "buildah",
+        "doc": "what builds the Dockerfile; buildkit needs user namespaces this cluster's apparmor forbids",
     },
 }
 
