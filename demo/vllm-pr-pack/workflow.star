@@ -21,17 +21,17 @@ params = {
     },
     "max_jobs": {
         "type": "int",
-        "default": 32,
+        "default": 64,
         "min": 1,
         "max": 96,
         "doc": "compile parallelism",
     },
     "build_timeout": {
         "type": "int",
-        "default": 9000,
+        "default": 3600,
         "min": 300,
-        "max": 12600,
-        "doc": "buildit build timeout in seconds",
+        "max": 3600,
+        "doc": "buildit build timeout in seconds; the run's buildit policy caps this at 3600",
     },
     "builder": {
         "type": "string",
